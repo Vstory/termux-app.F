@@ -32,7 +32,7 @@ env:
   # 独立页：tag 前缀与 Sweep 的匹配规则必须同源
   TAG_PREFIX: ci-
   TAG_PATTERN: '^ci-[0-9]{8}-[0-9]{4}-[0-9a-f]{8}-r[0-9]+$'
-  JAVA_VERSION: '17'
+  JAVA_VERSION: '21'
   ANDROID_PLATFORM: android-36
   BUILD_TOOLS: 36.0.0
   NDK_VERSION: 29.0.14206865
@@ -46,7 +46,7 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     env:
       # checkout 内部的 git init 会为默认分支名刷 hint，命令行级配置压得住
       GIT_CONFIG_COUNT: '1'
