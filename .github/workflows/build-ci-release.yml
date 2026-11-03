@@ -1,0 +1,91 @@
+name: Build · CI · Release · Termux.F
+
+# 与上游 debug_build.yml 的区别：手动触发、只出 apt-android-7 + arm64-v8a 单个 APK、注入 fork 版本号、
+# 校验签名与官方 GitHub 版一致（保证可覆盖升级）、一版一页发 Release。
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: build-ci-release-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  TERMUX_PACKAGE_VARIANT: apt-android-7
+  TERMUX_ABI_FILTER: arm64-v8a
+  TERMUX_BOOTSTRAP_ARCHS: aarch64
+  # GitHub 版 Termux 的签名证书指纹，见 TermuxConstants.APK_RELEASE_GITHUB_SIGNING_CERTIFICATE_SHA256_DIGEST
+  EXPECTED_CERT_SHA256: b6da01480eefd5fbf2cd3771b8d1021ec791304bdd6c4bf41d3faabad48ee5e1
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION_CODE="$(grep -m1 -E '^[[:space:]]+versionCode ' app/build.gradle | awk '{print $2}')"
+          SHORT_SHA="$(git rev-parse --short=7 HEAD)"
+          VERSION_NAME="${VERSION_NAME_PREFIX:-0.118.3}+f.${VERSION_CODE}.${SHORT_SHA}"
+          echo "code=${VERSION_CODE}" >> "$GITHUB_OUTPUT"
+          echo "name=${VERSION_NAME}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${VERSION_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Build APK
+        env:
+          TERMUX_APP_VERSION_NAME: ${{ steps.ver.outputs.name }}
+          TERMUX_APK_VERSION_TAG: ${{ steps.ver.outputs.name }}
+        run: ./gradlew :app:assembleDebug --no-daemon --stacktrace
+
+      - name: Validate APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK_DIR="app/build/outputs/apk/debug"
+          APK_FILE="$(ls "$APK_DIR"/termux-app.F_*_arm64-v8a.apk | head -1)"
+          test -f "$APK_FILE"
+          ls -lh "$APK_FILE"
+          echo "APK_FILE=$APK_FILE" >> "$GITHUB_ENV"
+
+          APKSIGNER="$(find "$ANDROID_HOME/build-tools" -name apksigner -type f | sort -V | tail -1)"
+          "$APKSIGNER" verify --print-certs "$APK_FILE" | tee /tmp/certs.txt
+          CERT="$(grep -oE 'certificate SHA-256 digest: [0-9a-f]+' /tmp/certs.txt | head -1 | awk '{print $NF}')"
+          if [ "$CERT" != "$EXPECTED_CERT_SHA256" ]; then
+            echo "签名证书不匹配：$CERT（期望 $EXPECTED_CERT_SHA256）——将无法覆盖官方 GitHub 版" >&2
+            exit 1
+          fi
+
+          sha256sum "$APK_FILE" | sed "s#${APK_DIR}/##" > /tmp/sha256sums
+          cat /tmp/sha256sums
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.ver.outputs.tag }}
+          VERSION_NAME: ${{ steps.ver.outputs.name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$APK_FILE" /tmp/sha256sums --clobber
+          else
+            gh release create "$TAG" "$APK_FILE" /tmp/sha256sums \
+              --title "Termux.F ${VERSION_NAME}" \
+              --notes "自用构建：应用名 Termux.F、arm64-v8a、apt-android-7 bootstrap、debug 签名（与官方 GitHub 版同证书，可直接覆盖升级）。终端默认字体改读 /system/fonts/DroidSansMono.ttf，绕开部分 ROM 对 monospace 族名的接管；~/.termux/font.ttf 仍优先。"
+          fi

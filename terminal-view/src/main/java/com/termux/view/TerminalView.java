@@ -42,6 +42,8 @@ import com.termux.terminal.TerminalEmulator;
 import com.termux.terminal.TerminalSession;
 import com.termux.view.textselection.TextSelectionCursorController;
 
+import java.io.File;
+
 /** View displaying and interacting with a {@link TerminalSession}. */
 public final class TerminalView extends View {
 
@@ -508,12 +510,28 @@ public final class TerminalView extends View {
     }
 
     /**
+     * 部分 ROM（OPPO/OnePlus 的字体引擎）会接管 monospace 族名解析，返回非等宽字体；TerminalRenderer
+     * 随后按 wcwidth 缩放宽度不符的字符，窄字形（i/l）被放大成粗块。直接读系统字体文件可绕开解析。
+     */
+    public static Typeface getSystemMonospaceTypeface() {
+        File file = new File("/system/fonts/DroidSansMono.ttf");
+        if (file.isFile() && file.canRead()) {
+            try {
+                return Typeface.createFromFile(file);
+            } catch (Exception e) {
+                // 文件损坏或格式不支持时退回族名
+            }
+        }
+        return Typeface.MONOSPACE;
+    }
+
+    /**
      * Sets the text size, which in turn sets the number of rows and columns.
      *
      * @param textSize the new font size, in density-independent pixels.
      */
     public void setTextSize(int textSize) {
-        mRenderer = new TerminalRenderer(textSize, mRenderer == null ? Typeface.MONOSPACE : mRenderer.mTypeface);
+        mRenderer = new TerminalRenderer(textSize, mRenderer == null ? getSystemMonospaceTypeface() : mRenderer.mTypeface);
         updateSize();
     }
 
