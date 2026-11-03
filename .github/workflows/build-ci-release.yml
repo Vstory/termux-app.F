@@ -1,91 +1,280 @@
 name: Build · CI · Release · Termux.F
 
-# 与上游 debug_build.yml 的区别：手动触发、只出 apt-android-7 + arm64-v8a 单个 APK、注入 fork 版本号、
-# 校验签名与官方 GitHub 版一致（保证可覆盖升级）、一版一页发 Release。
+# 母版：100_System/templates/build-ci-release-standalone.workflow.yml（独立页模型）
+#   · 同分支同工作流串行：新提交取消在跑的旧构建，被取消 run 留下的残页由下一个 run 的 Sweep 清掉
+#   · 每次构建发一个独立 Release 页（prerelease + latest=false），tag 带时间戳/短号/运行号
+#   · Gradle 依赖缓存（构建产物与实时数据不进缓存）
+#   · 与上游差异：只出 apt-android-7 + arm64-v8a 的 debug 包；签名沿用仓库自带的公开 debug key
+#     （与官方 GitHub 版同证书，可直接覆盖升级，故由产物断言保证指纹不变）
+
+run-name: "Build · CI · Release · Termux.F · ${{ github.ref_name }}"
 
 on:
+  push:
+    # 必须显式写 branches：只写 paths-ignore 时标签推送也会触发
+    branches: ['**']
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - '.gitignore'
   workflow_dispatch:
 
 concurrency:
-  group: build-ci-release-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
   contents: write
 
 env:
+  PREFIX: termux-f
+  VERSION_FILE: app/build.gradle
+  # 独立页：tag 前缀与 Sweep 的匹配规则必须同源
+  TAG_PREFIX: ci-
+  TAG_PATTERN: '^ci-[0-9]{8}-[0-9]{4}-[0-9a-f]{8}-r[0-9]+$'
+  JAVA_VERSION: '17'
+  ANDROID_PLATFORM: android-36
+  BUILD_TOOLS: 36.0.0
+  NDK_VERSION: 29.0.14206865
   TERMUX_PACKAGE_VARIANT: apt-android-7
   TERMUX_ABI_FILTER: arm64-v8a
   TERMUX_BOOTSTRAP_ARCHS: aarch64
   # GitHub 版 Termux 的签名证书指纹，见 TermuxConstants.APK_RELEASE_GITHUB_SIGNING_CERTIFICATE_SHA256_DIGEST
-  EXPECTED_CERT_SHA256: b6da01480eefd5fbf2cd3771b8d1021ec791304bdd6c4bf41d3faabad48ee5e1
+  EXPECTED_CERT_SHA256: B6DA01480EEFD5FBF2CD3771B8D1021EC791304BDD6C4BF41D3FAABAD48EE5E1
+  EXPECT_PACKAGE: com.termux
+  EXPECT_ABI: arm64-v8a
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      # checkout 内部的 git init 会为默认分支名刷 hint，命令行级配置压得住
+      GIT_CONFIG_COUNT: '1'
+      GIT_CONFIG_KEY_0: init.defaultBranch
+      GIT_CONFIG_VALUE_0: main
     steps:
-      - name: Checkout
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0
+          fetch-depth: 0   # AGP 会往 APK 里写 version-control-info；浅克隆下该信息不完整
 
-      - name: Set up JDK 17
-        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
-        with:
-          distribution: temurin
-          java-version: '17'
-
-      - name: Resolve version
-        id: ver
-        shell: bash
-        run: |
-          set -euo pipefail
-          VERSION_CODE="$(grep -m1 -E '^[[:space:]]+versionCode ' app/build.gradle | awk '{print $2}')"
-          SHORT_SHA="$(git rev-parse --short=7 HEAD)"
-          VERSION_NAME="${VERSION_NAME_PREFIX:-0.118.3}+f.${VERSION_CODE}.${SHORT_SHA}"
-          echo "code=${VERSION_CODE}" >> "$GITHUB_OUTPUT"
-          echo "name=${VERSION_NAME}" >> "$GITHUB_OUTPUT"
-          echo "tag=v${VERSION_NAME}" >> "$GITHUB_OUTPUT"
-
-      - name: Build APK
+      # 被 concurrency 取消的 run 会跳过后续所有 step，停在「页已建、包没传完」时自己收不了尾，
+      # 只能由下一个 run 在开头顺手清。判据：页的 target_commitish 命中「只被取消过、从未 success」
+      # 的 head sha（同提交重跑成功过的留着），再叠加 TAG_PATTERN —— 同仓库里手发页往往也是
+      # prerelease，不做这道过滤会连同它们一起删。正在跑的 run conclusion 为 null，不会误伤。
+      - name: Sweep release pages of cancelled runs
         env:
-          TERMUX_APP_VERSION_NAME: ${{ steps.ver.outputs.name }}
-          TERMUX_APK_VERSION_TAG: ${{ steps.ver.outputs.name }}
-        run: ./gradlew :app:assembleDebug --no-daemon --stacktrace
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          WF=$(basename "${GITHUB_WORKFLOW_REF%%@*}")
+          rows=$(gh run list --workflow "$WF" --limit 100 \
+                   --json headSha,conclusion \
+                   --jq '.[] | "\(.headSha) \(.conclusion)"' || true)
+          dead=$(printf '%s\n' "$rows" | awk '
+                   $2 == "success"   { ok[$1] = 1 }
+                   $2 == "cancelled" { seen[$1] = 1 }
+                   END { for (s in seen) if (!(s in ok)) print s }')
+          if [ -z "${dead//[[:space:]]/}" ]; then
+            echo "没有「只被取消过」的提交，跳过"
+            exit 0
+          fi
+          gh api "repos/${REPO}/releases?per_page=100" \
+            --jq '.[] | select(.prerelease) | "\(.target_commitish)\t\(.tag_name)"' \
+          | while IFS=$'\t' read -r sha tag; do
+              grep -qxF "$sha" <<<"$dead" || continue
+              grep -qE "$TAG_PATTERN" <<<"$tag" || continue
+              echo "::notice::清理被取消运行的产物页 ${tag}"
+              gh api -X DELETE "repos/${REPO}/releases/tags/${tag}" || true
+              gh api -X DELETE "repos/${REPO}/git/refs/tags/${tag}" || true
+            done
 
-      - name: Validate APK
-        shell: bash
+      - name: Set up JDK
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+
+      # 上游 CI 靠 AGP 自动拉 SDK/NDK；这里显式装 + 断言，缺一即在此失败，不留到 Gradle 报含糊错
+      - name: Set up Android SDK
         run: |
           set -euo pipefail
-          APK_DIR="app/build/outputs/apk/debug"
-          APK_FILE="$(ls "$APK_DIR"/termux-app.F_*_arm64-v8a.apk | head -1)"
-          test -f "$APK_FILE"
-          ls -lh "$APK_FILE"
-          echo "APK_FILE=$APK_FILE" >> "$GITHUB_ENV"
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          SDKM="$(command -v sdkmanager || echo "$SDK/cmdline-tools/latest/bin/sdkmanager")"
+          echo "SDK=$SDK"
+          yes | "$SDKM" --licenses >/dev/null 2>&1 || true
+          for pkg in "platforms;${ANDROID_PLATFORM}" "build-tools;${BUILD_TOOLS}" "ndk;${NDK_VERSION}"; do
+            "$SDKM" "$pkg" >/dev/null 2>&1 || sudo "$SDKM" "$pkg" >/dev/null 2>&1 \
+              || echo "::warning::$pkg 安装返回非零"
+          done
+          test -f "$SDK/platforms/${ANDROID_PLATFORM}/android.jar" \
+            || { echo "::error::platforms/${ANDROID_PLATFORM} 未就位"; exit 1; }
+          test -x "$SDK/build-tools/${BUILD_TOOLS}/aapt2" \
+            || { echo "::error::build-tools ${BUILD_TOOLS} 就位失败"; exit 1; }
+          test -x "$SDK/ndk/${NDK_VERSION}/ndk-build" \
+            || { echo "::error::ndk ${NDK_VERSION} 就位失败（libtermux-bootstrap.so 需要它）"; exit 1; }
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
 
-          APKSIGNER="$(find "$ANDROID_HOME/build-tools" -name apksigner -type f | sort -V | tail -1)"
-          "$APKSIGNER" verify --print-certs "$APK_FILE" | tee /tmp/certs.txt
-          CERT="$(grep -oE 'certificate SHA-256 digest: [0-9a-f]+' /tmp/certs.txt | head -1 | awk '{print $NF}')"
-          if [ "$CERT" != "$EXPECTED_CERT_SHA256" ]; then
-            echo "签名证书不匹配：$CERT（期望 $EXPECTED_CERT_SHA256）——将无法覆盖官方 GitHub 版" >&2
+      # 只缓存依赖（caches / wrapper），构建产物与实时数据不进这里
+      - name: Gradle cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', 'gradle.properties', 'gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      - name: Compute build info
+        id: info
+        run: |
+          echo "short=${GITHUB_SHA:0:8}" >> "$GITHUB_OUTPUT"
+          echo "ts=$(TZ=Asia/Shanghai date +%Y%m%d-%H%M)" >> "$GITHUB_OUTPUT"
+
+      # tag / 产物名 / 注入的 versionName 集中在这里：产物名被三处引用（重命名 / 发布 / 清理正则），
+      # 任一处漏改都是静默错 ⇒ 只能有一个来源。
+      # 版本名：源码里是 0.118.3+f.1000（build metadata 段），这里剥掉 + 段后重拼为
+      #   0.118.3+f.<code>.<短号> —— 直接拼会得到两个 `+`，过不了 build.gradle 的 semver 闸。
+      # 产物名去 + 段：`+` 在 URL/文件名里是麻烦，版本与 code 分段列出即可。
+      - name: Resolve target
+        id: target
+        env:
+          TS: ${{ steps.info.outputs.ts }}
+          SHORT: ${{ steps.info.outputs.short }}
+        run: |
+          set -euo pipefail
+          VER_RAW="$(sed -nE 's/^[[:space:]]*versionName "([^"]+)".*/\1/p' "$VERSION_FILE" | head -1)"
+          CODE="$(sed -nE 's/^[[:space:]]*versionCode ([0-9]+).*/\1/p' "$VERSION_FILE" | head -1)"
+          if [ -z "$VER_RAW" ] || [ -z "$CODE" ]; then
+            echo "::error::读不到 versionName/versionCode（$VERSION_FILE）"
             exit 1
           fi
+          BASE="${VER_RAW%%+*}"
+          case "$BASE" in
+            ""|*[!A-Za-z0-9._-]*) echo "::error::版本名非法：'$BASE'"; exit 1 ;;
+          esac
+          EXPECT_VN="${BASE}+f.${CODE}.${SHORT}"
 
-          sha256sum "$APK_FILE" | sed "s#${APK_DIR}/##" > /tmp/sha256sums
-          cat /tmp/sha256sums
+          RELEASE_TAG="${TAG_PREFIX}${TS}-${SHORT}-r${GITHUB_RUN_NUMBER}"
+          APK_NAME="${PREFIX}_${BASE}.${CODE}_${TS}_ci-debug_${SHORT}.apk"
 
-      - name: Publish release
+          {
+            echo "tag=${RELEASE_TAG}"
+            echo "apk=${APK_NAME}"
+            echo "ver=${BASE}"
+            echo "code=${CODE}"
+            echo "expect_vn=${EXPECT_VN}"
+          } >> "$GITHUB_OUTPUT"
+          echo "产物名：${APK_NAME}"
+          echo "注入 versionName：${EXPECT_VN}"
+
+      # 版本号由 CI 就地注入（只改 runner 工作区，源码保持 0.118.3+f.1000）
+      - name: Gradle build
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ steps.ver.outputs.tag }}
-          VERSION_NAME: ${{ steps.ver.outputs.name }}
-        shell: bash
+          TERMUX_APP_VERSION_NAME: ${{ steps.target.outputs.expect_vn }}
+          TERMUX_APK_VERSION_TAG: ${{ steps.target.outputs.ver }}
         run: |
           set -euo pipefail
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" "$APK_FILE" /tmp/sha256sums --clobber
+          chmod +x gradlew
+          ./gradlew --no-daemon :app:assembleDebug
+          ls -la app/build/outputs/apk/debug/ || true
+
+      - name: Rename APK and assert naming rule
+        env:
+          APK_NAME: ${{ steps.target.outputs.apk }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          SRC="$(ls app/build/outputs/apk/debug/termux-app.F_*_arm64-v8a.apk | head -1)"
+          [ -f "$SRC" ] || { echo "::error::未找到产物"; ls -la app/build/outputs/apk/debug/ || true; exit 1; }
+          cp -- "$SRC" "dist/${APK_NAME}"
+          RE='^[A-Za-z0-9._-]+_[0-9]{8}-[0-9]{4}_ci-(debug|release)_[0-9a-f]{8}\.apk$'
+          printf '%s' "$APK_NAME" | grep -qE "$RE" \
+            || { echo "::error::产物名与规则不符: $APK_NAME"; exit 1; }
+          ls -la dist
+
+      # 断言产物可用：包名 / 版本号与源码一致 / 单 ABI / debug 变体 / 签名指纹等于官方 GitHub 版
+      - name: Verify APK
+        env:
+          EXPECT_VN: ${{ steps.target.outputs.expect_vn }}
+          EXPECT_CODE: ${{ steps.target.outputs.code }}
+        run: |
+          set -euo pipefail
+          APKSIGNER="$(ls -d "$ANDROID_SDK_ROOT"/build-tools/*/apksigner 2>/dev/null | sort -V | tail -1)"
+          AAPT2="$(ls -d "$ANDROID_SDK_ROOT"/build-tools/*/aapt2 2>/dev/null | sort -V | tail -1)"
+          [ -x "$APKSIGNER" ] || { echo "::error::找不到 apksigner，拒绝发布"; exit 1; }
+          [ -x "$AAPT2" ] || { echo "::error::找不到 aapt2"; exit 1; }
+
+          for APK in dist/*.apk; do
+            echo "════ 校验 $APK"
+            BADGING="$("$AAPT2" dump badging "$APK" 2>/dev/null || true)"
+            PKG_LINE="$(printf '%s' "$BADGING" | grep -m1 '^package:' || true)"
+            [ -n "$PKG_LINE" ] || { echo "::error::读不到 badging package 行"; exit 1; }
+            printf '%s' "$PKG_LINE" | grep -Fq "name='${EXPECT_PACKAGE}'" \
+              || { echo "::error::包名不符（期望 ${EXPECT_PACKAGE}）：$PKG_LINE"; exit 1; }
+            printf '%s' "$PKG_LINE" | grep -Fq "versionCode='${EXPECT_CODE}'" \
+              || { echo "::error::versionCode 与源码不符（期望 ${EXPECT_CODE}）：$PKG_LINE"; exit 1; }
+            printf '%s' "$PKG_LINE" | grep -Fq "versionName='${EXPECT_VN}'" \
+              || { echo "::error::versionName 与注入值不符（期望 ${EXPECT_VN}）：$PKG_LINE"; exit 1; }
+            echo "  ✅ 包名/版本一致：${EXPECT_PACKAGE} ${EXPECT_VN}(${EXPECT_CODE})"
+
+            NC="$(printf '%s' "$BADGING" | grep -m1 '^native-code:' || true)"
+            printf '%s' "$NC" | grep -Fq "'${EXPECT_ABI}'" \
+              || { echo "::error::缺少 ${EXPECT_ABI} native-code：$NC"; exit 1; }
+            echo "  ✅ native-code：$NC"
+
+            printf '%s' "$BADGING" | grep -q '^application-debuggable$' \
+              || { echo "::error::产物不是 debug 变体（无 application-debuggable）"; exit 1; }
+            echo "  ✅ debug 变体"
+
+            OUT="$("$APKSIGNER" verify --print-certs "$APK" 2>&1 || true)"
+            if printf '%s' "$OUT" | grep -qi 'DOES NOT VERIFY\|Missing.*signature\|no signature'; then
+              echo "::error::签名校验失败"; printf '%s\n' "$OUT"; exit 1
+            fi
+            DIGEST="$(printf '%s' "$OUT" | sed -nE 's/^.*certificate SHA-256 digest: ([0-9a-fA-F]+).*$/\1/p' | head -1)"
+            [ -n "$DIGEST" ] || { echo "::error::读不到签名指纹"; printf '%s\n' "$OUT"; exit 1; }
+            ACTUAL="$(printf '%s' "$DIGEST" | tr -d ':' | tr 'a-f' 'A-F')"
+            if [ "$ACTUAL" != "$EXPECTED_CERT_SHA256" ]; then
+              echo "::error::签名指纹与官方 GitHub 版不符 —— 将无法覆盖升级"
+              echo "  期望: $EXPECTED_CERT_SHA256"; echo "  实际: $ACTUAL"; exit 1
+            fi
+            echo "  ✅ 签名指纹与官方 GitHub 版一致：$ACTUAL"
+          done
+
+      # artifact 名必须带 run_number：upload-artifact 拒绝同名 artifact（不覆盖），
+      # 「同一 commit、同一分钟」重复触发时 ts 与短号会相同 ⇒ 直接失败
+      - name: Upload artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ env.PREFIX }}-ci-debug-${{ steps.info.outputs.ts }}-${{ steps.info.outputs.short }}-${{ github.run_number }}
+          path: dist/*.apk
+          if-no-files-found: error
+
+      # 每次构建一个独立 Release 页；同一 tag 只会在重跑时出现 ⇒ 走 edit 覆盖。
+      # prerelease + latest=false：CI 包不抢「最新」。不要给 asset 写 label（会顶替文件名显示）。
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_TAG: ${{ steps.target.outputs.tag }}
+          REPO: ${{ github.repository }}
+          VER: ${{ steps.target.outputs.ver }}
+          CODE: ${{ steps.target.outputs.code }}
+          SHORT: ${{ steps.info.outputs.short }}
+        run: |
+          set -euo pipefail
+          NOTES="**Commit** [\`${SHORT}\`](https://github.com/${REPO}/commit/${GITHUB_SHA})"
+          NOTES="$NOTES · **Branch** \`${GITHUB_REF_NAME}\` · **Version** ${VER} (versionCode ${CODE})"
+          NOTES="$NOTES · **Variant** ci-debug / arm64-v8a / apt-android-7"
+          NOTES="$NOTES · 应用名 Termux.F · 签名与官方 GitHub 版同证书，可直接覆盖升级"
+
+          if gh release view "$TARGET_TAG" >/dev/null 2>&1; then
+            echo "tag $TARGET_TAG 已存在 —— 按重跑处理"
+            gh release edit "$TARGET_TAG" --notes "$NOTES" --prerelease --latest=false
           else
-            gh release create "$TAG" "$APK_FILE" /tmp/sha256sums \
-              --title "Termux.F ${VERSION_NAME}" \
-              --notes "自用构建：应用名 Termux.F、arm64-v8a、apt-android-7 bootstrap、debug 签名（与官方 GitHub 版同证书，可直接覆盖升级）。终端默认字体改读 /system/fonts/DroidSansMono.ttf，绕开部分 ROM 对 monospace 族名的接管；~/.termux/font.ttf 仍优先。"
+            jq -n --arg t "$TARGET_TAG" --arg b "$NOTES" --arg c "$GITHUB_SHA" \
+              '{tag_name:$t, name:$t, target_commitish:$c, body:$b, prerelease:true}' \
+            | gh api -X POST "/repos/${REPO}/releases" --input -
           fi
+
+          gh release upload "$TARGET_TAG" dist/*.apk --clobber >/dev/null
+          echo "已发布：https://github.com/${REPO}/releases/tag/${TARGET_TAG}"
